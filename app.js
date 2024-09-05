@@ -1,42 +1,87 @@
 const net = require('net');
-const { WebSocket, createWebSocketStream } = require('ws');
-const { TextDecoder } = require('util');
+const WebSocket = require('ws');
+const express = require('express');
+const http = require('http');
+const auth = require("basic-auth");
 
-const logcb = (...args) => console.log(...args);
-const errcb = (...args) => console.error(...args);
+const username = process.env.WEB_USERNAME || "admin";
+const password = process.env.WEB_PASSWORD || "password";
 
-const uuid = (process.env.UUID || 'd342d11e-d424-4583-b36e-524ab1f0afa4').replace(/-/g, "");
+const logcb = (...args) => console.log.bind(console, new Date().toISOString(), ...args);
+const errcb = (...args) => console.error.bind(console, new Date().toISOString(), ...args);
+
+const uuid = (process.env.UUID || '37a0bd7c-8b9f-4693-8916-bd1e2da0a817').replace(/-/g, '');
 const port = process.env.PORT || 3000;
 
-const wss = new WebSocket.Server({ port }, logcb('listen:', port));
+const app = express();
 
-wss.on('connection', ws => {
-    console.log("on connection");
+const server = http.createServer(app);
 
-    ws.once('message', msg => {
-        const [VERSION] = msg;
-        const id = msg.slice(1, 17);
+const wss = new WebSocket.Server({ server }, logcb('WebSocket server is listening on port:', port));
 
-        if (!id.every((value, index) => value === parseInt(uuid.substr(index * 2, 2), 16))) return;
+wss.on('connection', (ws, req) => {
+    const clientIP = req.socket.remoteAddress;
+    const clientPort = req.socket.remotePort;
+    logcb('New connection established from', `${clientIP}:${clientPort}`)();
 
-        let index = msg.slice(17, 18).readUInt8() + 19;
-        const remotePort = msg.slice(index, index += 2).readUInt16BE(0);
-        const ATYP = msg.slice(index, index += 1).readUInt8();
+    ws.once('message', (msg) => {
+        let i = msg.readUInt8(17) + 19;
+        const targetPort = msg.readUInt16BE(i);
+        i += 2;
 
-        const host = 
-            ATYP === 1 ? msg.slice(index, index += 4).join('.') : // IPV4
-            ATYP === 2 ? new TextDecoder().decode(msg.slice(index + 1, index += 1 + msg.slice(index, index + 1).readUInt8())) : // domain
-            ATYP === 3 ? msg.slice(index, index += 16).reduce((acc, byte, i, arr) =>
-                (i % 2 ? acc.concat(arr.slice(i - 1, i + 1)) : acc), []).map(byte => byte.readUInt16BE(0).toString(16)).join(':') : 
-            ''; // IPV6
+        const ATYP = msg.slice(i, i += 1).readUInt8();
+        const host = ATYP === 1 ? msg.slice(i, i += 4).join('.') : // IPv4
+            (ATYP === 2 ? new TextDecoder().decode(msg.slice(i + 1, i += 1 + msg.slice(i, i + 1).readUInt8())) : // Domain
+                (ATYP === 3 ? msg.slice(i, i += 16).reduce((s, b, i, a) => (i % 2 ? s.concat(a.slice(i - 1, i + 1)) : s), []).map(b => b.readUInt16BE(0).toString(16)).join(':') : '')); // IPv6
 
-        logcb('conn:', host, remotePort);
-        ws.send(new Uint8Array([VERSION, 0]));
+        logcb('Resolved target', `Host: ${host}, Port: ${targetPort}`)();
 
-        const duplex = createWebSocketStream(ws);
-        net.connect({ host, port: remotePort }, function () {
-            this.write(msg.slice(index));
-            duplex.on('error', errcb('E1:')).pipe(this).on('error', errcb('E2:')).pipe(duplex);
-        }).on('error', errcb('Conn-Err:', { host, remotePort }));
-    }).on('error', errcb('EE:'));
+        ws.send(Buffer.from([msg[0], 0]));
+
+        const duplex = WebSocket.createWebSocketStream(ws);
+
+        const socket = net.connect({ host, port: targetPort }, function () {
+            logcb('Connected to target', `Host: ${host}, Port: ${targetPort}`)();
+            this.write(msg.slice(i));
+
+            duplex.on('error', errcb('Duplex Stream Error:'))
+                .pipe(this)
+                .on('error', errcb('Target Socket Error:'))
+                .pipe(duplex);
+        });
+
+        socket.on('error', errcb('Connection Error:', { host, port: targetPort }));
+    }).on('error', errcb('WebSocket Error:'));
+
+    ws.on('close', logcb('Connection closed with', `${clientIP}:${clientPort}`));
+});
+
+app.use((req, res, next) => {
+  const user = auth(req);
+  if (user && user.name === username && user.pass === password) {
+    return next();
+  }
+  res.set("WWW-Authenticate", 'Basic realm="Node"');
+  return res.status(401).send();
+});
+
+app.get('*', (req, res) => {
+    const protocol = req.protocol;
+    let host = req.get('host');
+    let port = protocol === 'https' ? 443 : 80;
+    let path = req.path;
+    
+    if (host.includes(':')) {
+        [host, port] = host.split(':');
+    }
+
+    const link = protocol === 'https' ?
+        `vless://${uuid}@${host}:${port}?path=${path}&security=tls&encryption=none&host=${host}&type=ws&sni=${host}#node-vless` :
+        `vless://${uuid}@${host}:${port}?type=ws&encryption=none&flow=&host=${host}&path=${path}#node-vless`;
+
+    res.send(`<html><body><pre>${link}</pre></body></html>`);
+});
+
+server.listen(port, () => {
+    logcb('Server is listening on port:', port)();
 });
